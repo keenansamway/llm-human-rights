@@ -18,3 +18,7 @@ openai
 anthropic
 google-genai
 googletrans
+
+evaluate
+datasets
+rouge_score
