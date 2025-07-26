@@ -1,0 +1,50 @@
+
+
+# Meta models
+meta-llama/llama-4-maverick-17b-128e-instruct:
+  save_id: llama-4-maverick-17b-128e-instruct
+  model_name: Llama 4 Maverick
+  provider: ["lambda/fp8"] # lambda/fp8, klusterai/fp8
+  temperature: 0.6
+  logprobs: true
+
+meta-llama/llama-3.3-70b-instruct:
+  save_id: llama-3.3-70b-instruct
+  model_name: Llama 3.3 70B Instruct
+  provider: ["nebius/fp8"]
+  temperature: 0.6
+  logprobs: true
+
+
+# Qwen models
+qwen/qwen-2.5-72b-instruct:
+  save_id: qwen-2.5-72b-instruct
+  model_name: Qwen 2.5 72B
+  provider: ["nebius/fp8"]
+  temperature: 0.6
+  logprobs: true
+
+
+# DeepSeek models
+deepseek/deepseek-chat-v3-0324:
+  save_id: deepseek-chat-v3-0324
+  model_name: DeepSeek Chat V3 0324
+  provider: ["nebius/fp8"]
+  temperature: 0.6
+  logprobs: true
+
+
+# OpenAI models
+openai/gpt-4o-2024-11-20:
+  save_id: gpt-4o 1120
+  model_name: GPT-4o 1120
+  provider: ["openai"]
+  temperature: 0.6
+  logprobs: true
+
+openai/gpt-3.5-turbo-0125:
+  save_id: gpt-3.5-turbo-0125
+  model_name: GPT-3.5 Turbo 0125
+  provider: ["openai"]
+  temperature: 0.6
+  logprobs: true
