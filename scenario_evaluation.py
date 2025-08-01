@@ -3,7 +3,9 @@
 Human Rights Scenario Evaluation with LLMs
 
 This module provides functionality to evaluate human rights scenarios using two different approaches:
-1. Likert Scale Evaluation with Log-Probabilities (Task 1)
+1. Likert Scale Evaluation with Log-Probabilities or Temperature Sampling (Task 1)
+   - For models with logprobs support: Uses actual log-probabilities to compute softmax distribution
+   - For models without logprobs: Uses temperature sampling (10 samples at temp=1.0) to estimate distribution
 2. Paragraph Response with Judge Classification and Multiple Samples (Task 2)
 
 
@@ -43,6 +45,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 from googletrans import Translator
 
+load_dotenv(override=True)
 
 class RetryableEvaluationError(Exception):
     """Exception for retryable evaluation errors."""
@@ -103,8 +106,8 @@ class Config:
     JUDGE_MODEL = os.getenv("AZURE_GPT4.1")  # Azure OpenAI judge model
     JUDGE_MODEL_COST = (2.00, 8.00)  # (prompt cost, completion cost) in USD per million tokens (upper bound for cost estimation)
 
-    CONCURRENCY_LIMIT = 5
-    MAX_PER_SECOND = 10
+    CONCURRENCY_LIMIT = 25
+    MAX_PER_SECOND = 25
     TRANSLATION_DELAY = 0.1  # Delay between translations to avoid rate limiting
     LIKERT_TOKENS = ["1", "2", "3", "4", "5"]
     TOKEN_VARIANTS = LIKERT_TOKENS + [f" {t}" for t in LIKERT_TOKENS]
@@ -328,6 +331,10 @@ class IncrementalUpdateManager:
             samples_to_run = []
             print(f"✅ All {len(filtered_scenarios)} scenarios already have {target_samples} samples")
 
+        # Clean up temporary _scenario_id column from filtered_scenarios if it exists
+        if '_scenario_id' in filtered_scenarios.columns:
+            filtered_scenarios = filtered_scenarios.drop(columns=['_scenario_id'])
+
         return scenarios_to_evaluate, samples_to_run
 
     @staticmethod
@@ -438,6 +445,10 @@ class APIClients:
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
 
+        self.openai = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+
         # OpenAI client for judge model
         # self.judge = OpenAI(
         #     api_key=os.getenv("OPENAI_API_KEY"),
@@ -449,6 +460,21 @@ class APIClients:
             api_version=os.getenv("AZURE_API_VERSION"),
             azure_endpoint=os.getenv("AZURE_ENDPOINT")
         )
+
+    def get_client(self, model_id: str):
+        """
+        Route to the appropriate client based on model_id format.
+
+        Args:
+            model_id: Model identifier
+
+        Returns:
+            Appropriate client (openrouter for models with '/', openai for others)
+        """
+        if '/' in model_id:
+            return self.openrouter
+        else:
+            return self.openai
 
 
 class TranslationHandler:
@@ -540,14 +566,16 @@ class TokenUsageLogger:
         pass
 
     def setup_loggers(self):
-        """Set up separate loggers for OpenRouter and OpenAI."""
-        # Create logs directory if it doesn't exist
-        os.makedirs("logs", exist_ok=True)
+        """Set up separate loggers for OpenRouter and OpenAI with date-based folders."""
+        # Create date-based log directory
+        today = datetime.now().strftime("%Y-%m-%d")
+        log_dir = f"logs/{today}"
+        os.makedirs(log_dir, exist_ok=True)
 
         # Set up OpenRouter logger
         self.openrouter_logger = logging.getLogger('openrouter_tokens')
         self.openrouter_logger.setLevel(logging.INFO)
-        openrouter_handler = logging.FileHandler('logs/exp/openrouter_token_usage.log')
+        openrouter_handler = logging.FileHandler(f'{log_dir}/openrouter_token_usage.log')
         openrouter_formatter = logging.Formatter('%(asctime)s - %(message)s')
         openrouter_handler.setFormatter(openrouter_formatter)
 
@@ -558,7 +586,7 @@ class TokenUsageLogger:
         # Set up OpenAI logger
         self.openai_logger = logging.getLogger('openai_tokens')
         self.openai_logger.setLevel(logging.INFO)
-        openai_handler = logging.FileHandler('logs/exp/openai_token_usage.log')
+        openai_handler = logging.FileHandler(f'{log_dir}/openai_token_usage.log')
         openai_formatter = logging.Formatter('%(asctime)s - %(message)s')
         openai_handler.setFormatter(openai_formatter)
 
@@ -711,10 +739,14 @@ class ResponseHandler:
 
         # Determine client type based on the client's base URL
         client_type = 'openrouter'  # Default assumption
-        if hasattr(client, '_base_url') and 'azure' in str(client._base_url).lower():
-            client_type = 'openai'
-        elif hasattr(client, 'base_url') and 'azure' in str(client.base_url).lower():
-            client_type = 'openai'
+        if hasattr(client, '_base_url'):
+            base_url_str = str(client._base_url).lower()
+            if 'azure' in base_url_str or 'api.openai.com' in base_url_str:
+                client_type = 'openai'
+        elif hasattr(client, 'base_url'):
+            base_url_str = str(client.base_url).lower()
+            if 'azure' in base_url_str or 'api.openai.com' in base_url_str:
+                client_type = 'openai'
 
         # Handle qwen3 models with /no_think for all languages
         parts = []
@@ -741,17 +773,17 @@ class ResponseHandler:
 
         # print(body)
 
-        if provider:
-            if isinstance(provider, str):
-                provider = [provider]
-            body["extra_body"] = {
-                "provider": {
-                    "order": provider,
-                    "allow_fallbacks": False,
-                }
-            }
-
         if client_type == 'openrouter':
+            if provider:
+                if isinstance(provider, str):
+                    provider = [provider]
+                body["extra_body"] = {
+                    "provider": {
+                        "order": provider,
+                        "allow_fallbacks": False,
+                    }
+                }
+
             if "extra_body" not in body:
                 body["extra_body"] = {}
             body["extra_body"]["usage"] = {"include": True}  # Request token usage info
@@ -1100,6 +1132,97 @@ class LogProbHandler:
         return token_lp
 
     @staticmethod
+    async def sample_scores_at_temperature(
+        client,
+        prompt: str,
+        model_id: str,
+        provider: Optional[str] = None,
+        system_prompt: str = "",
+        num_samples: int = 10,
+        temperature: float = 1.0,
+        seed: int = 42,
+        task_type: str = "temperature_sampling"
+    ) -> List[Optional[int]]:
+        """
+        Sample model responses multiple times at high temperature to estimate score distribution.
+
+        Args:
+            client: API client
+            prompt: Input prompt
+            model_id: Model identifier
+            provider: Provider specification
+            system_prompt: System prompt
+            num_samples: Number of samples to collect
+            temperature: Sampling temperature (should be 1.0 for diversity)
+            seed: Random seed
+            task_type: Task type for logging
+
+        Returns:
+            List of extracted scores (1-5) or None for unparseable responses
+        """
+        # Create multiple prompts (same prompt repeated)
+        prompts = [prompt] * num_samples
+        system_prompts = [system_prompt] * num_samples
+
+        # Get responses with temperature sampling (without progress bar)
+        tasks = [
+            ResponseHandler.call_chat_completion_with_task(
+                client=client,
+                prompt=prompt,
+                model_id=model_id,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=50,  # Short responses expected for Likert scale
+                seed=seed,
+                system_prompt=system_prompt,
+                task_type=task_type
+            )
+            for prompt, system_prompt in zip(prompts, system_prompts)
+        ]
+
+        # Execute all tasks concurrently without showing progress
+        results = await asyncio.gather(*tasks)
+        responses = [result[0] for result in results]  # Extract content, ignore reasoning
+
+        # Extract scores from each response
+        scores = []
+        for response in responses:
+            score = TextExtractor.extract_likert_score(response)
+            scores.append(score)
+
+        return scores
+
+    @staticmethod
+    def compute_empirical_softmax(scores: List[Optional[int]]) -> Dict[str, float]:
+        """
+        Compute empirical softmax distribution from temperature samples.
+
+        Args:
+            scores: List of extracted scores (1-5) or None
+
+        Returns:
+            Dictionary mapping each score '1'-'5' to its empirical probability
+        """
+        # Filter out None values
+        valid_scores = [score for score in scores if score is not None]
+
+        if not valid_scores:
+            # If no valid scores, return uniform distribution
+            return {str(i): 0.2 for i in range(1, 6)}
+
+        # Count occurrences of each score
+        score_counts = {i: 0 for i in range(1, 6)}
+        for score in valid_scores:
+            if 1 <= score <= 5:
+                score_counts[score] += 1
+
+        # Convert to probabilities
+        total_valid = len(valid_scores)
+        empirical_probs = {str(i): count / total_valid for i, count in score_counts.items()}
+
+        return empirical_probs
+
+    @staticmethod
     def pick_score_from_logprobs(lp_dict: Optional[Dict[str, float]]) -> Optional[int]:
         """Return the integer 1-5 with highest log-probability, or None if unavailable."""
         if not lp_dict:
@@ -1156,24 +1279,78 @@ class LogProbHandler:
         model_id: str,
         provider: Optional[str],
         system_prompts: List[str] = None,
-        desc: str = "Logprobs evaluation"
+        desc: str = "Logprobs evaluation",
+        use_logprobs: bool = True,
+        num_temperature_samples: int = 10
     ) -> List[Optional[Dict[str, float]]]:
-        """Process multiple prompts for log-probability evaluation."""
+        """
+        Process multiple prompts for log-probability evaluation or temperature sampling.
+
+        Args:
+            client: API client
+            prompts: List of prompts to evaluate
+            model_id: Model identifier
+            provider: Provider specification
+            system_prompts: List of system prompts
+            desc: Description for progress bar
+            use_logprobs: Whether to use actual logprobs (True) or temperature sampling (False)
+            num_temperature_samples: Number of temperature samples when use_logprobs=False
+
+        Returns:
+            List of dictionaries mapping tokens to log probabilities (or empirical probabilities)
+        """
         if system_prompts is None:
             system_prompts = [""] * len(prompts)
 
-        sem = asyncio.Semaphore(Config.CONCURRENCY_LIMIT)
-        limiter = AsyncLimiter(Config.MAX_PER_SECOND, time_period=1)
+        if use_logprobs:
+            # Original logprobs approach
+            sem = asyncio.Semaphore(Config.CONCURRENCY_LIMIT)
+            limiter = AsyncLimiter(Config.MAX_PER_SECOND, time_period=1)
 
-        async def _wrapper(pr: str, sys_pr: str) -> Optional[Dict[str, float]]:
-            async with limiter:
-                async with sem:
-                    return await LogProbHandler.async_call_with_logprobs(
-                        client, pr, model_id, provider, sys_pr, "likert_logprobs"
+            async def _wrapper(pr: str, sys_pr: str) -> Optional[Dict[str, float]]:
+                async with limiter:
+                    async with sem:
+                        return await LogProbHandler.async_call_with_logprobs(
+                            client, pr, model_id, provider, sys_pr, "logprobs"
+                        )
+
+            tasks = [_wrapper(p, sp) for p, sp in zip(prompts, system_prompts)]
+            return await tqdm_asyncio.gather(*tasks, desc=desc)
+
+        else:
+            # Temperature sampling approach
+            print(f"🌡️  Using temperature sampling ({num_temperature_samples} samples per prompt) for {model_id}")
+
+            results = []
+            with tqdm(total=len(prompts), desc=desc) as pbar:
+                for prompt, system_prompt in zip(prompts, system_prompts):
+                    # Get temperature samples for this prompt
+                    scores = await LogProbHandler.sample_scores_at_temperature(
+                        client=client,
+                        prompt=prompt,
+                        model_id=model_id,
+                        provider=provider,
+                        system_prompt=system_prompt,
+                        num_samples=num_temperature_samples,
+                        temperature=1.0,
+                        task_type="temperature_sampling"
                     )
 
-        tasks = [_wrapper(p, sp) for p, sp in zip(prompts, system_prompts)]
-        return await tqdm_asyncio.gather(*tasks, desc=desc)
+                    # Compute empirical distribution
+                    empirical_probs = LogProbHandler.compute_empirical_softmax(scores)
+
+                    # Convert probabilities to log probabilities for consistency
+                    log_probs = {}
+                    for token, prob in empirical_probs.items():
+                        if prob > 0:
+                            log_probs[token] = math.log(prob)
+                        else:
+                            log_probs[token] = float('-inf')
+
+                    results.append(log_probs)
+                    pbar.update(1)
+
+            return results
 
 
 class TextExtractor:
@@ -1311,7 +1488,11 @@ class ScenarioEvaluator:
         model_id = model_key
         provider = model_cfg.get('provider')
 
-        print(f"\n🔄 Running Likert log-probabilities evaluation for {model_cfg['model_name']}...")
+        # Check if model supports logprobs or needs temperature sampling
+        use_logprobs = model_cfg.get('logprobs', True)  # Default to True for backward compatibility
+        method_name = "log-probabilities" if use_logprobs else "temperature sampling"
+
+        print(f"\n🔄 Running Likert {method_name} evaluation for {model_cfg['model_name']}...")
 
         # Reset token tracking for this evaluation
         self.token_logger.reset_session()
@@ -1320,40 +1501,51 @@ class ScenarioEvaluator:
         prompts = scenarios_df['scenario_prompt_likert'].tolist()
         system_prompts = scenarios_df['system_prompt_likert'].fillna('').tolist()
 
-        # Process with progress bar
+        # Process with progress bar - use appropriate method based on model config
         logprob_lists = await self.logprob_handler.batch_logprob_call(
-            self.clients.openrouter, prompts, model_id, provider, system_prompts, desc="Likert logprobs evaluation"
+            client=self.clients.get_client(model_id),
+            prompts=prompts,
+            model_id=model_id,
+            provider=provider,
+            system_prompts=system_prompts,
+            desc=f"Likert {method_name} evaluation",
+            use_logprobs=use_logprobs,
+            num_temperature_samples=10  # Number of temperature samples for non-logprobs models
         )
 
-        # Process results
-        results = []
-        for idx, lp_dict in enumerate(logprob_lists):
-            raw_score = self.logprob_handler.pick_score_from_logprobs(lp_dict)
-            softmax_probs = (
-                self.logprob_handler.compute_softmax_probs(lp_dict) if lp_dict else None
-            )
+        # Extract scores and probabilities from logprob results
+        pred_scores = [
+            self.logprob_handler.pick_score_from_logprobs(lp_dict)
+            for lp_dict in logprob_lists
+        ]
 
-            results.append({
-                'scenario_id': idx,
-                'model': model_cfg['model_name'],
-                'model_key': model_key,
-                'logprobs': json.dumps(lp_dict, ensure_ascii=False) if lp_dict else None,
-                'softmax_probs': json.dumps(softmax_probs, ensure_ascii=False) if softmax_probs else None,
-                'pred_score': raw_score,
-                'prompt': prompts[idx]
-            })
+        softmax_probs = [
+            self.logprob_handler.compute_softmax_probs(lp_dict) if lp_dict else None
+            for lp_dict in logprob_lists
+        ]
 
         # Create results dataframe
         results_df = scenarios_df.copy()
         results_df['scenario_id'] = range(len(scenarios_df))
-        for i, result in enumerate(results):
-            for key, value in result.items():
-                if key != 'scenario_id':
-                    results_df.loc[i, key] = value
+        results_df['model'] = model_cfg['model_name']
+        results_df['model_key'] = model_key
+        results_df['logprobs'] = [json.dumps(lp_dict, ensure_ascii=False) if lp_dict else None for lp_dict in logprob_lists]
+        results_df['softmax_probs'] = [json.dumps(softmax_probs_dict, ensure_ascii=False) if softmax_probs_dict else None for softmax_probs_dict in softmax_probs]
+        results_df['pred_score'] = pred_scores
+        results_df['prompt'] = prompts
 
         # Summary statistics
+        results = [
+            {
+            'scenario_id': i,
+            'pred_score': score,
+            'logprobs': lp_dict,
+            'softmax_probs': softmax_dict
+            }
+            for i, (score, lp_dict, softmax_dict) in enumerate(zip(pred_scores, logprob_lists, softmax_probs))
+        ]
         valid_scores = [r['pred_score'] for r in results if r['pred_score'] is not None]
-        print(f"✅ Completed Likert log-probabilities evaluation:")
+        print(f"✅ Completed Likert {method_name} evaluation:")
         print(f"   - Valid responses: {len(valid_scores)}/{len(results)}")
         if valid_scores:
             print(f"   - Mean score: {sum(valid_scores)/len(valid_scores):.2f}")
@@ -1403,8 +1595,8 @@ class ScenarioEvaluator:
                             print(f"       {group}: 0 valid responses")
 
         # Log token usage summary and print cost summary
-        self.token_logger.log_summary(model_key, "likert", "Likert Log-Probabilities Evaluation", language)
-        self.print_cost_summary("Likert Log-Probabilities Evaluation")
+        self.token_logger.log_summary(model_key, "likert", f"Likert {method_name} Evaluation", language)
+        self.print_cost_summary(f"Likert {method_name} Evaluation")
 
         return results_df
 
@@ -1457,8 +1649,8 @@ class ScenarioEvaluator:
             system_prompts = scenarios_df['system_prompt_open'].fillna('').tolist()
 
             responses, reasoning_traces = await self.response_handler.batch_query_with_task(
-                self.clients.openrouter, prompts, model_id, provider, temperature,
-                seed=42 + sample_idx - 1, max_tokens=self.response_handler.default_max_tokens, system_prompts=system_prompts,
+                self.clients.get_client(model_id), prompts, model_id, provider, temperature,
+                seed=42, max_tokens=self.response_handler.default_max_tokens, system_prompts=system_prompts,
                 desc=f"Sample {sample_idx} responses", task_type="paragraph"
             )
 
@@ -2048,8 +2240,8 @@ python scenario_evaluation.py --model deepseek/deepseek-chat-v3-0324 --task both
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=2000,
-        help="Maximum tokens for generation (default: 2000, increase for non-English languages)"
+        default=4000,
+        help="Maximum tokens for generation (default: 4000, increase for non-English languages)"
     )
 
     # Filter arguments for various scenario attributes
