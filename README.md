@@ -49,6 +49,56 @@ You can download the data files from Google Drive at the following link: <https:
 
 Place the .parquet files in the `data/results` directory, and they can be ready by the `results_viz.ipynb` notebook to replicate the figures in the paper.
 
+### Results
+Here we describe the columns contained in the results files.
+
+#### Common columns
+- `limited_article`: The article number being limited in the scenario.
+- `limited_article_name`: The name of the article being limited in the scenario.
+- `limited_right_text`: The text of the right being limited in the scenario.
+- `actor`: The actor limiting the right.
+- `severity`: The severity of the rights limitation (1-3).
+- `state_of_emergency`: Whether the scenario mentions a state of emergency ("no", "civil_unrest", "natural_disaster").
+- `affected_group`: The group affected by the rights limitation.
+- `scenario_text`: The text of the scenario itself.
+- `plausibility`: The plausibility of the scenario (according to an LLM judge).
+- `clarity`: The clarity of the scenario (according to an LLM judge).
+- `justification`: The justification for the rights limitation (according to an LLM judge).
+- `neutrality`: The neutrality of the scenario (according to an LLM judge).
+- `severity_score`: How severely the scenario is perceived to be (according to an LLM judge).
+- `primarily_limited`: The article numbers primarily limited in this scenario (according to an LLM judge).
+- `substantially_limited`: The article numbers substantially limited in this scenario (according to an LLM judge).
+- `moderately_limited`: The article numbers moderately limited in this scenario (according to an LLM judge).
+- `somewhat_limited`: The article numbers somewhat limited in this scenario (according to an LLM judge).
+- `somewhat_promoted`: The article numbers somewhat promoted in this scenario (according to an LLM judge).
+- `moderately_promoted`: The article numbers moderately promoted in this scenario (according to an LLM judge).
+- `substantially_promoted`: The article numbers strongly promoted in this scenario (according to an LLM judge).
+- `primarily_promoted`: The article numbers primarily promoted in this scenario (according to an LLM judge).
+- `lang_code`: The language code for the scenario (e.g. "en", "zh-cn", "ro", etc.).
+- `scenario_prompt_likert`: The scenario prompt for the Likert scale rating.
+- `scenario_prompt_open`: The scenario prompt for the open-ended response.
+- `system_prompt_likert`: The system prompt for the Likert scale rating.
+- `system_prompt_open`: The system prompt for the open-ended response.
+- `scenario_id`: The unique identifier for the scenario.
+- `model`: The model used for the scenario.
+- `model_key`: The corresponding model id.
+
+#### Likert results
+- `logprobs`: Log probabilities for the model's response (over the tokens " 1", " 2", " 3", " 4", " 5")
+- `softmax_probs`: Softmax probabilities for the model's response (computed relative to the other possible tokens).
+- `pred_score`: The model's endorsement score for the scenario (1-5).
+
+#### Paragraph results (open-ended)
+- `paragraph_response`: The model's open-ended response.
+- `paragraph_reasoning`: If a reasoning model, the model's reasoning text.
+- `translated_response`: The model's response translated into English.
+- `translated_reasoning`: The model's reasoning text translated into English.
+- `judge_raw_response`: The raw JSON formatted response from the judge model.
+- `classification`: The classification label assigned by the model (e.g. "strongly_reject", etc.).
+- `pred_score`: The model's prediction score for the scenario (1-5).
+
+
+
 ### Models and Languages Tested
 The data contains results for the following models:
 - OpenAI
