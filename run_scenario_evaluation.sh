@@ -42,7 +42,7 @@ model_tasks=(
     # "mistralai/mistral-large-2407 likert"
     # "mistralai/mistral-medium-3 likert"
 
-    # Other (Note Run) #
+    # Other (Not Run) #
 
     # "anthropic/claude-3.5-sonnet paragraph"
     # "openai/gpt-4.1-2025-04-14 paragraph"
